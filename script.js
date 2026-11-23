@@ -40,12 +40,15 @@ const PRODUCTS = [
     desc: "가볍고 단단한 쉘과 부드러운 안쪽 쿠션으로 정강이를 보호합니다. 2개 1세트." }
 ];
 
-/* ---------- 3. 회원 등급 (누적 구매 금액 기준, 4단계) ---------- */
+/* ---------- 3. 회원 등급 (4단계) ----------
+   code : DB(shop_profiles.grade)에 저장되는 값 — WELCOME · SILVER · GOLD · VIP
+   name : 화면에 보여 줄 내 쇼핑몰 등급 이름 (화면에서만 바꿔 보여 줌)
+   등급과 포인트는 DB 가 관리하므로 화면에서는 읽기만 합니다. */
 const GRADES = [
-  { id: "rookie", name: "루키",   minSpent: 0,       rate: 0.01, color: "#9DB0D6", desc: "가입 즉시 부여" },
-  { id: "pro",    name: "프로",   minSpent: 200000,  rate: 0.03, color: "#6F8FFF", desc: "누적 구매 20만원 이상" },
-  { id: "star",   name: "스타",   minSpent: 500000,  rate: 0.05, color: "#F5C542", desc: "누적 구매 50만원 이상" },
-  { id: "legend", name: "레전드", minSpent: 1000000, rate: 0.07, color: "#FF8A65", desc: "누적 구매 100만원 이상" }
+  { code: "WELCOME", name: "루키",   rate: 0.01, color: "#9DB0D6", desc: "가입 즉시 부여" },
+  { code: "SILVER",  name: "프로",   rate: 0.03, color: "#6F8FFF", desc: "누적 구매 20만원 이상" },
+  { code: "GOLD",    name: "스타",   rate: 0.05, color: "#F5C542", desc: "누적 구매 50만원 이상" },
+  { code: "VIP",     name: "레전드", rate: 0.07, color: "#FF8A65", desc: "누적 구매 100만원 이상" }
 ];
 
 /* ---------- 4. 쇼핑몰 설정 ---------- */
@@ -59,12 +62,10 @@ const SETTINGS = {
 
 
 /* =========================================================
-   저장소
-   지금은 브라우저(localStorage)에 저장합니다.
-   다음 주 데이터베이스 연결 때는 이 DB 객체 안의 함수만
-   서버 요청(fetch)으로 바꾸면 나머지 코드는 그대로 쓸 수 있습니다.
+   브라우저 저장소 — 장바구니와 재고 계산용 판매 수량만 저장합니다.
+   회원 정보 · 비밀번호 · 로그인 상태는 저장하지 않습니다 (Supabase Auth 가 관리).
    ========================================================= */
-const DB = {
+const LOCAL = {
   load(key, fallback) {
     try {
       const value = localStorage.getItem("fks_" + key);
@@ -74,20 +75,22 @@ const DB = {
   save(key, value) {
     try { localStorage.setItem("fks_" + key, JSON.stringify(value)); } catch (e) { /* 저장 불가 시 무시 */ }
   },
-  getUsers()       { return this.load("users", {}); },
-  saveUsers(users) { this.save("users", users); },
-  getSession()     { return this.load("session", null); },
-  saveSession(id)  { this.save("session", id); },
   getCart()        { return this.load("cart", []); },
   saveCart(cart)   { this.save("cart", cart); },
   getSold()        { return this.load("sold", {}); },     // 상품별 판매 수량 (재고 계산용)
-  saveSold(sold)   { this.save("sold", sold); }
+  saveSold(sold)   { this.save("sold", sold); },
+  /* 주문 내역은 다음 단계에서 shop_orders 로 옮기기 전까지 회원 id 별로 임시 보관 */
+  getOrders(uid)        { return this.load("orders_" + uid, []); },
+  saveOrders(uid, list) { this.save("orders_" + uid, list); }
 };
 
-let users = DB.getUsers();
-let session = DB.getSession();
-let cart = DB.getCart();
-let sold = DB.getSold();
+/* 예전 버전이 브라우저에 남긴 회원 정보 · 로그인 기록 지우기 */
+try { localStorage.removeItem("fks_users"); localStorage.removeItem("fks_session"); } catch (e) { /* 무시 */ }
+
+let authUser = null;     // Supabase Auth 로그인 계정 (없으면 null)
+let profile = null;      // shop_profiles 의 내 한 줄 (없으면 null)
+let cart = LOCAL.getCart();
+let sold = LOCAL.getSold();
 let currentCategory = "all";
 let searchWord = "";
 let afterLogin = null;   // 로그인 후 이어서 할 일 (예: 결제)
@@ -112,14 +115,9 @@ function formatDate(time) {
 function stockLeft(product) { return Math.max(0, product.stock - (sold[product.id] || 0)); }
 function inCart(productId) { return cart.filter((c) => c.id === productId).reduce((sum, c) => sum + c.qty, 0); }
 
-function currentUser() { return session && users[session] ? users[session] : null; }
-function gradeOf(spent) {
-  let grade = GRADES[0];
-  GRADES.forEach((g) => { if (spent >= g.minSpent) grade = g; });
-  return grade;
-}
-function myGrade() { const u = currentUser(); return gradeOf(u ? u.totalSpent : 0); }
-function nextGrade(grade) { return GRADES[GRADES.indexOf(grade) + 1] || null; }
+function currentUser() { return profile; }
+function gradeByCode(code) { return GRADES.find((g) => g.code === code) || GRADES[0]; }
+function myGrade() { return gradeByCode(profile ? profile.grade : "WELCOME"); }
 function gradeBadge(g) { return `<span class="grade-badge" style="background:${g.color}">${g.name}</span>`; }
 
 let toastTimer;
@@ -131,19 +129,6 @@ function showToast(message) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
 }
 
-/* 비밀번호는 그대로 저장하지 않고 변환(해시)해서 저장합니다. */
-async function hashPassword(pw) {
-  const text = "fks-salt::" + pw;
-  if (window.crypto && crypto.subtle) {
-    const buffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-  let h = 5381;
-  for (const ch of text) h = ((h << 5) + h + ch.charCodeAt(0)) | 0;
-  return "h" + (h >>> 0).toString(16);
-}
-
-
 /* =========================================================
    모달 열기 / 닫기
    ========================================================= */
@@ -153,6 +138,7 @@ function openModal(id) {
 }
 function closeModal(id) {
   $("#" + id).classList.remove("open");
+  if (id === "authModal" && !profile) afterLogin = null;   // 로그인하지 않고 닫으면 '로그인 후 할 일' 취소
   if (!document.querySelector(".modal.open")) document.body.classList.remove("no-scroll");
 }
 document.addEventListener("click", (e) => {
@@ -358,7 +344,7 @@ function renderDetail() {
    장바구니 (수량 바꾸기 · 삭제 · 합계)
    ========================================================= */
 function saveCart() {
-  DB.saveCart(cart);
+  LOCAL.saveCart(cart);
   $("#cartCount").textContent = cart.reduce((sum, c) => sum + c.qty, 0);
 }
 
@@ -439,8 +425,69 @@ $("#cartBody").addEventListener("click", (e) => {
 
 
 /* =========================================================
-   회원가입 · 로그인 · 로그아웃
+   회원가입 · 로그인 · 로그아웃 (Supabase Auth)
    ========================================================= */
+
+/* Supabase 오류 문구를 한글 안내문으로 바꾸기 */
+function koreanAuthError(error) {
+  const msg = ((error && error.message) || "").toLowerCase();
+  if (msg.includes("already registered") || msg.includes("already been registered")) return "이미 가입된 이메일입니다. 로그인해 주세요.";
+  if (msg.includes("invalid login credentials")) return "이메일 또는 비밀번호가 올바르지 않습니다.";
+  if (msg.includes("email not confirmed")) return "이메일 인증이 끝나지 않았습니다. 받은 메일의 인증 링크를 눌러 주세요.";
+  if (msg.includes("password") && (msg.includes("at least") || msg.includes("6"))) return "비밀번호는 6자 이상이어야 합니다.";
+  if (msg.includes("unable to validate email") || msg.includes("invalid format") || msg.includes("email address") && msg.includes("invalid")) return "이메일 형식을 확인해 주세요.";
+  if (msg.includes("rate limit")) return "잠시 후 다시 시도해 주세요. (요청이 너무 많습니다)";
+  if (msg.includes("failed to fetch") || msg.includes("network")) return "서버에 연결할 수 없습니다. 인터넷 연결을 확인해 주세요.";
+  if (msg.includes("signups not allowed") || msg.includes("signup is disabled")) return "지금은 회원가입을 받을 수 없습니다.";
+  return "처리 중 오류가 났습니다. 잠시 후 다시 시도해 주세요." + (error && error.message ? ` (${error.message})` : "");
+}
+
+function dbReady(errorBox) {
+  if (db) return true;
+  const msg = "데이터베이스에 연결되지 않았습니다. 잠시 후 새로 고침해 주세요.";
+  if (errorBox) $(errorBox).textContent = msg; else showToast(msg);
+  return false;
+}
+
+/* shop_profiles 에서 내 한 줄 읽기 */
+async function loadProfile() {
+  if (!authUser) { profile = null; return; }
+  const { data, error } = await db
+    .from("shop_profiles")
+    .select("id, email, name, phone, grade, points, role, created_at")
+    .eq("id", authUser.id)
+    .single();
+  if (error) {
+    console.error("회원 정보 읽기 실패:", error.message);
+    // 표를 못 읽어도 로그인 상태는 보여 줄 수 있게 계정 정보로 채움
+    const meta = authUser.user_metadata || {};
+    profile = { id: authUser.id, email: authUser.email, name: meta.name || authUser.email, phone: meta.phone || "",
+                grade: "WELCOME", points: 0, role: "member", created_at: authUser.created_at, _fallback: true };
+    return;
+  }
+  profile = data;
+}
+
+/* 페이지가 열릴 때 로그인 상태 확인 */
+async function initAuth() {
+  if (!db) { refreshUser(); return; }
+  const { data, error } = await db.auth.getSession();
+  if (error) console.error("로그인 상태 확인 실패:", error.message);
+  authUser = data && data.session ? data.session.user : null;
+  await loadProfile();
+  refreshUser();
+  // 다른 탭에서 로그인 · 로그아웃해도 맞춰지도록
+  db.auth.onAuthStateChange((event, session) => {
+    if (event === "SIGNED_OUT" || (event === "SIGNED_IN" && (!authUser || authUser.id !== session.user.id))) {
+      setTimeout(async () => {
+        authUser = session ? session.user : null;
+        await loadProfile();
+        refreshUser();
+      }, 0);
+    }
+  });
+}
+
 function openAuth(tab) { switchAuthTab(tab); openModal("authModal"); }
 function switchAuthTab(tab) {
   $$(".auth-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
@@ -451,119 +498,149 @@ function switchAuthTab(tab) {
   $("#signupError").textContent = "";
 }
 $$(".auth-tab").forEach((t) => t.addEventListener("click", () => switchAuthTab(t.dataset.tab)));
-$("#userBtn").addEventListener("click", () => (currentUser() ? openMyPage("orders") : openAuth("login")));
-$("#joinBtn").addEventListener("click", () => (currentUser() ? openMyPage("points") : openAuth("signup")));
+
+/* 메뉴 버튼: 로그인 중이면 「이름 님 · 로그아웃」, 아니면 「로그인 · 회원가입」 */
+function onUserClick(e) { if (e) e.preventDefault(); $("#nav").classList.remove("open"); profile ? openMyPage("orders") : openAuth("login"); }
+function onAuthClick(e) { if (e) e.preventDefault(); $("#nav").classList.remove("open"); profile ? logout() : openAuth("signup"); }
+$("#userBtn").addEventListener("click", onUserClick);
+$("#authBtn").addEventListener("click", onAuthClick);
+$("#navUser").addEventListener("click", onUserClick);
+$("#navAuth").addEventListener("click", onAuthClick);
+$("#joinBtn").addEventListener("click", () => (profile ? openMyPage("info") : openAuth("signup")));
+
+function setBusy(form, busy, text) {
+  const btn = form.querySelector('button[type="submit"]');
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.disabled = busy;
+  btn.textContent = busy ? text : btn.dataset.label;
+}
 
 $("#signupForm").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const form = e.target;
   const name = $("#signupName").value.trim();
   const email = $("#signupEmail").value.trim().toLowerCase();
   const pw = $("#signupPw").value;
   const phone = $("#signupPhone").value.trim();
-  const addr = $("#signupAddr").value.trim();
   const error = (msg) => { $("#signupError").textContent = msg; };
+  error("");
 
   if (!name) return error("이름을 입력해 주세요.");
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return error("이메일 형식을 확인해 주세요.");
-  if (users[email]) return error("이미 가입된 이메일입니다.");
-  if (pw.length < 8) return error("비밀번호는 8자 이상이어야 합니다.");
+  if (pw.length < 6) return error("비밀번호는 6자 이상이어야 합니다.");
   if (pw !== $("#signupPw2").value) return error("비밀번호 확인이 일치하지 않습니다.");
   if (!/^01[0-9]-?\d{3,4}-?\d{4}$/.test(phone)) return error("휴대폰 번호를 확인해 주세요.");
-  if (!addr) return error("배송지 주소를 입력해 주세요.");
   if (!$("#signupAgree").checked) return error("필수 약관에 동의해 주세요.");
+  if (!dbReady("#signupError")) return;
 
-  const now = Date.now();
-  users[email] = {
-    name, email, phone, addr,
-    password: await hashPassword(pw),
-    joinedAt: now,
-    points: SETTINGS.signupPoint,
-    totalSpent: 0,
-    orders: [],
-    pointHistory: [{ date: now, text: "회원가입 축하 포인트", amount: SETTINGS.signupPoint }]
-  };
-  DB.saveUsers(users);
-  e.target.reset();
-  login(email);
-  showToast(`가입을 환영합니다! ${point(SETTINGS.signupPoint)}가 지급되었습니다.`);
+  setBusy(form, true, "가입 중...");
+  const { data, error: err } = await db.auth.signUp({
+    email,
+    password: pw,
+    options: { data: { name, phone } }     // DB 가 shop_profiles 한 줄을 만들 때 쓰는 이름 · 연락처
+  });
+  setBusy(form, false);
+
+  if (err) return error(koreanAuthError(err));
+  // 이메일 확인이 켜져 있을 때 이미 있는 이메일은 오류 대신 빈 계정이 돌아옴
+  if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+    return error("이미 가입된 이메일입니다. 로그인해 주세요.");
+  }
+  form.reset();
+  if (!data.session) {
+    closeModal("authModal");
+    showToast("가입 신청이 완료되었습니다. 메일의 인증 링크를 누른 뒤 로그인해 주세요.");
+    return;
+  }
+  authUser = data.user;
+  await loadProfile();
+  showToast(`가입을 환영합니다! ${point(profile ? profile.points : SETTINGS.signupPoint)}가 지급되었습니다.`);
+  afterSignIn();
 });
 
 $("#loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const form = e.target;
   const email = $("#loginEmail").value.trim().toLowerCase();
-  const user = users[email];
-  if (!user || user.password !== (await hashPassword($("#loginPw").value))) {
-    $("#loginError").textContent = "이메일 또는 비밀번호가 올바르지 않습니다.";
-    return;
-  }
-  e.target.reset();
-  login(email);
-  showToast(`${user.name}님, 반갑습니다.`);
+  const pw = $("#loginPw").value;
+  $("#loginError").textContent = "";
+  if (!email || !pw) { $("#loginError").textContent = "이메일과 비밀번호를 입력해 주세요."; return; }
+  if (!dbReady("#loginError")) return;
+
+  setBusy(form, true, "로그인 중...");
+  const { data, error } = await db.auth.signInWithPassword({ email, password: pw });
+  setBusy(form, false);
+  if (error) { $("#loginError").textContent = koreanAuthError(error); return; }
+
+  form.reset();
+  authUser = data.user;
+  await loadProfile();
+  showToast(`${profile ? profile.name : ""} 님, 반갑습니다.`);
+  afterSignIn();
 });
 
-function login(email) {
-  session = email;
-  DB.saveSession(session);
+function afterSignIn() {
   closeModal("authModal");
   refreshUser();
   if (afterLogin) { const next = afterLogin; afterLogin = null; next(); }
 }
-function logout() {
-  session = null;
-  DB.saveSession(null);
+
+async function logout() {
+  if (db) {
+    const { error } = await db.auth.signOut();
+    if (error) { showToast(koreanAuthError(error)); return; }
+  }
+  authUser = null;
+  profile = null;
   closeModal("myModal");
   refreshUser();
   showToast("로그아웃되었습니다.");
 }
+
 function refreshUser() {
-  const u = currentUser();
-  $("#userLabel").innerHTML = u ? `${escapeHTML(u.name)} ${gradeBadge(gradeOf(u.totalSpent))}` : "로그인";
+  const name = profile ? `${escapeHTML(profile.name || profile.email)} 님` : "로그인";
+  $("#userLabel").innerHTML = profile ? `${name} ${gradeBadge(myGrade())}` : name;
+  $("#authLabel").textContent = profile ? "로그아웃" : "회원가입";
+  $("#navUser").textContent = profile ? `${profile.name || profile.email} 님 (마이페이지)` : "로그인";
+  $("#navAuth").textContent = profile ? "로그아웃" : "회원가입";
   renderProducts();
 }
 
 
 /* =========================================================
    체험 결제 (실제 결제 없이 주문 내역만 남김)
+   ※ 다음 단계에서 주문을 shop_orders · shop_order_items 에 저장합니다.
+     포인트 차감 · 적립과 등급 변경은 DB 가 맡으므로 이번 단계에서는 화면에서 바꾸지 않습니다.
    ========================================================= */
-let usePoint = 0;
-
 function startCheckout() {
   if (!cart.length) { showToast("장바구니가 비어 있습니다."); return; }
-  if (!currentUser()) {
+  if (!profile) {
     afterLogin = startCheckout;
     openAuth("login");
     showToast("주문하려면 로그인해 주세요.");
     return;
   }
-  usePoint = 0;
   renderCheckout();
   openModal("checkoutModal");
 }
 
 function renderCheckout() {
-  const u = currentUser();
-  const grade = gradeOf(u.totalSpent);
-  const s = cartSummary(usePoint);
-  const earn = Math.floor((s.subtotal - usePoint) * grade.rate);
+  const grade = myGrade();
+  const s = cartSummary(0);
+  const earn = Math.floor(s.subtotal * grade.rate);
 
   $("#checkoutTitle").textContent = "주문 / 체험 결제";
   $("#checkoutBody").innerHTML = `<form id="orderForm" novalidate><div class="checkout">
     <div>
       <div class="box">
         <h3>배송지</h3>
-        <label for="orderName">받는 분</label><input id="orderName" value="${escapeHTML(u.name)}">
-        <label for="orderPhone">연락처</label><input id="orderPhone" type="tel" value="${escapeHTML(u.phone)}">
-        <label for="orderAddr">주소</label><input id="orderAddr" value="${escapeHTML(u.addr)}">
+        <label for="orderName">받는 분</label><input id="orderName" value="${escapeHTML(profile.name)}">
+        <label for="orderPhone">연락처</label><input id="orderPhone" type="tel" value="${escapeHTML(profile.phone)}">
+        <label for="orderAddr">주소</label><input id="orderAddr" placeholder="도로명 주소와 상세 주소">
       </div>
       <div class="box">
-        <h3>포인트 사용 <small style="color:var(--gray);font-weight:400">(보유 ${point(u.points)})</small></h3>
-        <label for="pointInput" class="sr-only">사용할 포인트</label>
-        <div class="point-row">
-          <input id="pointInput" type="number" min="0" step="100" inputmode="numeric" placeholder="${point(SETTINGS.minPointUse)} 이상" value="${usePoint || ""}">
-          <button type="button" class="btn btn-outline btn-sm" id="applyPoint">적용</button>
-          <button type="button" class="btn btn-outline btn-sm" id="allPoint">전액</button>
-        </div>
-        <p class="error" id="pointError"></p>
+        <h3>포인트 <small style="color:var(--gray);font-weight:400">(보유 ${point(profile.points)})</small></h3>
+        <p style="font-size:13.5px;color:var(--gray)">포인트 사용은 주문을 DB 에 저장하는 다음 단계에서 열립니다.</p>
       </div>
       <div class="box">
         <h3>결제 수단 (체험)</h3>
@@ -580,70 +657,48 @@ function renderCheckout() {
       ${s.lines.map((l) => `<div class="sum-row"><span>${escapeHTML(l.product.name)} (${l.size}) × ${l.qty}</span><b>${won(l.product.price * l.qty)}</b></div>`).join("")}
       <div class="sum-row total" style="font-size:15px"><span>상품 합계</span><b style="font-size:15px;color:var(--text)">${won(s.subtotal)}</b></div>
       <div class="sum-row"><span>배송비</span><b>${s.shipping ? won(s.shipping) : "무료"}</b></div>
-      <div class="sum-row"><span>포인트 사용</span><b class="minus">-${point(usePoint)}</b></div>
       <div class="sum-row total"><span>최종 결제 금액</span><b>${won(s.total)}</b></div>
       <div class="sum-row"><span>${gradeBadge(grade)} ${Math.round(grade.rate * 100)}% 적립 예정</span><b class="plus">+${point(earn)}</b></div>
       <p class="error" id="orderError"></p>
       <button type="submit" class="btn btn-accent btn-block">${won(s.total)} 체험 결제하기</button>
-      <p style="font-size:12.5px;color:var(--gray);margin-top:8px;text-align:center">실제 결제는 되지 않고 주문 내역만 저장됩니다.</p>
+      <p style="font-size:12.5px;color:var(--gray);margin-top:8px;text-align:center">실제 결제는 되지 않고 주문 내역만 남습니다.</p>
     </div>
   </div></form>`;
-
-  const maxPoint = Math.min(u.points, s.subtotal);
-  const applyPoint = (value) => {
-    const n = Math.floor((Number(value) || 0) / 100) * 100;
-    if (n > 0 && n < SETTINGS.minPointUse) { $("#pointError").textContent = `포인트는 ${point(SETTINGS.minPointUse)}부터 사용할 수 있습니다.`; return; }
-    if (n > maxPoint) { $("#pointError").textContent = `최대 ${point(maxPoint)}까지 사용할 수 있습니다.`; return; }
-    usePoint = n;
-    renderCheckout();
-  };
-  $("#applyPoint").addEventListener("click", () => applyPoint($("#pointInput").value));
-  $("#allPoint").addEventListener("click", () => applyPoint(maxPoint));
   $("#orderForm").addEventListener("submit", (e) => { e.preventDefault(); placeOrder(); });
 }
 
 function placeOrder() {
-  const u = currentUser();
   const name = $("#orderName").value.trim();
   const phone = $("#orderPhone").value.trim();
   const addr = $("#orderAddr").value.trim();
   if (!name || !phone || !addr) { $("#orderError").textContent = "배송지 정보를 모두 입력해 주세요."; return; }
 
-  const s = cartSummary(usePoint);
+  const s = cartSummary(0);
   for (const l of s.lines) {
     if (inCart(l.id) > stockLeft(l.product)) { $("#orderError").textContent = `${l.product.name} 재고가 부족합니다.`; return; }
   }
 
+  const grade = myGrade();
   const now = Date.now();
   const d = new Date(now);
-  const gradeBefore = gradeOf(u.totalSpent);
-  const paidGoods = s.subtotal - usePoint;              // 포인트 사용분은 적립·등급에서 제외
-  const earned = Math.floor(paidGoods * gradeBefore.rate);
   const order = {
     orderNo: `FKS${d.getFullYear()}${twoDigit(d.getMonth() + 1)}${twoDigit(d.getDate())}-${String(now).slice(-5)}`,
     date: now,
-    items: s.lines.map((l) => ({ id: l.id, name: l.product.name, size: l.size, qty: l.qty, price: l.product.price, image: l.product.image })),
-    subtotal: s.subtotal, shipping: s.shipping, usedPoint: usePoint, total: s.total, earnedPoint: earned,
+    items: s.lines.map((l) => ({ id: l.id, name: l.product.name, size: l.size, qty: l.qty, price: l.product.price })),
+    subtotal: s.subtotal, shipping: s.shipping, total: s.total,
+    expectedPoint: Math.floor(s.subtotal * grade.rate),
     payMethod: document.querySelector('input[name="pay"]:checked').value,
-    receiver: { name, phone, addr },
     status: "주문 완료"
   };
 
-  // 재고 차감
   s.lines.forEach((l) => { sold[l.id] = (sold[l.id] || 0) + l.qty; });
-  DB.saveSold(sold);
-
-  // 포인트 · 누적 금액
-  if (usePoint) { u.points -= usePoint; u.pointHistory.unshift({ date: now, text: `주문 사용 (${order.orderNo})`, amount: -usePoint }); }
-  if (earned) { u.points += earned; u.pointHistory.unshift({ date: now, text: `구매 적립 ${Math.round(gradeBefore.rate * 100)}% (${order.orderNo})`, amount: earned }); }
-  u.totalSpent += paidGoods;
-  u.orders.unshift(order);
-  DB.saveUsers(users);
-
+  LOCAL.saveSold(sold);
+  const orders = LOCAL.getOrders(profile.id);
+  orders.unshift(order);
+  LOCAL.saveOrders(profile.id, orders);
   cart = [];
   saveCart();
-  const gradeAfter = gradeOf(u.totalSpent);
-  refreshUser();
+  renderProducts();
 
   $("#checkoutTitle").textContent = "주문 완료";
   $("#checkoutBody").innerHTML = `<div class="done">
@@ -654,76 +709,109 @@ function placeOrder() {
     <div class="box" style="margin-top:18px">
       ${order.items.map((i) => `<div class="sum-row"><span>${escapeHTML(i.name)} (${i.size}) × ${i.qty}</span><b>${won(i.price * i.qty)}</b></div>`).join("")}
       <div class="sum-row total"><span>결제 금액</span><b>${won(order.total)}</b></div>
-      <div class="sum-row"><span>적립 포인트</span><b class="plus">+${point(earned)}</b></div>
-      <div class="sum-row"><span>보유 포인트</span><b>${point(u.points)}</b></div>
+      <div class="sum-row"><span>적립 예정 포인트</span><b class="plus">+${point(order.expectedPoint)}</b></div>
     </div>
-    ${gradeAfter !== gradeBefore ? `<p class="notice">누적 구매 금액이 늘어 ${gradeAfter.name} 등급이 되었습니다. 다음 주문부터 ${Math.round(gradeAfter.rate * 100)}% 적립됩니다.</p>` : ""}
     <div class="btn-row" style="margin-top:16px">
       <button type="button" class="btn btn-outline" data-close>쇼핑 계속하기</button>
       <button type="button" class="btn btn-primary" id="viewOrders">주문 내역 보기</button>
     </div>`;
   $("#viewOrders").addEventListener("click", () => { closeModal("checkoutModal"); openMyPage("orders"); });
-  if (gradeAfter !== gradeBefore) showToast(`축하합니다! ${gradeAfter.name} 등급이 되었습니다.`);
 }
 
 
 /* =========================================================
-   마이페이지 (주문 내역 · 포인트 · 회원 정보)
+   마이페이지 (shop_profiles 에서 내 한 줄 읽기 · 이름과 연락처 수정)
    ========================================================= */
-function openMyPage(tab) { renderMyPage(tab); openModal("myModal"); }
+async function openMyPage(tab) {
+  if (!profile) {
+    afterLogin = () => openMyPage(tab);
+    openAuth("login");
+    showToast("로그인이 필요합니다.");
+    return;
+  }
+  if (db && authUser) await loadProfile();   // 열 때마다 DB 에서 최신 값 읽기
+  renderMyPage(tab);
+  openModal("myModal");
+}
 
 function renderMyPage(tab) {
-  const u = currentUser();
-  if (!u) return;
-  const grade = gradeOf(u.totalSpent);
-  const next = nextGrade(grade);
-  const progress = next ? Math.min(100, ((u.totalSpent - grade.minSpent) / (next.minSpent - grade.minSpent)) * 100) : 100;
-
+  if (!profile) return;
+  const grade = myGrade();
   let content = "";
+
   if (tab === "orders") {
-    content = u.orders.length ? u.orders.map((o) => `<div class="order-card">
+    const orders = LOCAL.getOrders(profile.id);
+    content = orders.length ? orders.map((o) => `<div class="order-card">
       <header><span><b>${o.orderNo}</b> · ${formatDate(o.date)}</span><span class="status">${o.status}</span></header>
       ${o.items.map((i) => `<div class="sum-row"><span>${escapeHTML(i.name)} (${i.size}) × ${i.qty}</span><b>${won(i.price * i.qty)}</b></div>`).join("")}
       <div class="sum-row"><span>결제 (${o.payMethod})</span><b>${won(o.total)}</b></div>
-      ${o.usedPoint ? `<div class="sum-row"><span>포인트 사용</span><b class="minus">-${point(o.usedPoint)}</b></div>` : ""}
-      <div class="sum-row"><span>적립</span><b class="plus">+${point(o.earnedPoint)}</b></div>
+      <div class="sum-row"><span>적립 예정</span><b class="plus">+${point(o.expectedPoint || 0)}</b></div>
     </div>`).join("") : '<p class="empty">아직 주문 내역이 없습니다.</p>';
-  } else if (tab === "points") {
-    content = `<table class="point-table"><tbody>${u.pointHistory.map((h) =>
-      `<tr><td style="color:var(--gray)">${formatDate(h.date)}</td><td>${escapeHTML(h.text)}</td><td class="${h.amount > 0 ? "plus" : "minus"}">${h.amount > 0 ? "+" : ""}${point(h.amount)}</td></tr>`
-    ).join("")}</tbody></table>`;
   } else {
-    content = `<table class="spec"><tbody>
-      <tr><th>이름</th><td>${escapeHTML(u.name)}</td></tr>
-      <tr><th>이메일</th><td>${escapeHTML(u.email)}</td></tr>
-      <tr><th>휴대폰</th><td>${escapeHTML(u.phone)}</td></tr>
-      <tr><th>배송지</th><td>${escapeHTML(u.addr)}</td></tr>
-      <tr><th>가입일</th><td>${formatDate(u.joinedAt)}</td></tr>
-      <tr><th>누적 구매</th><td>${won(u.totalSpent)}</td></tr>
-    </tbody></table>
-    <button type="button" class="btn btn-outline btn-block" id="logoutBtn" style="margin-top:16px">로그아웃</button>`;
+    content = `<form id="profileForm" novalidate>
+      <label for="pfName">이름</label>
+      <input id="pfName" value="${escapeHTML(profile.name)}" autocomplete="name">
+      <label for="pfPhone">휴대폰 번호</label>
+      <input id="pfPhone" type="tel" value="${escapeHTML(profile.phone)}" placeholder="010-0000-0000" autocomplete="tel">
+      <table class="spec" style="margin-top:16px"><tbody>
+        <tr><th>이메일</th><td>${escapeHTML(profile.email)}</td></tr>
+        <tr><th>등급</th><td>${gradeBadge(grade)} 적립률 ${Math.round(grade.rate * 100)}%</td></tr>
+        <tr><th>포인트</th><td>${point(profile.points)}</td></tr>
+        <tr><th>가입일</th><td>${profile.created_at ? formatDate(profile.created_at) : "-"}</td></tr>
+      </tbody></table>
+      <p style="font-size:12.5px;color:var(--gray);margin-top:6px">등급과 포인트는 쇼핑몰(DB)이 관리하며 직접 바꿀 수 없습니다.</p>
+      <p class="error" id="profileError"></p>
+      <button type="submit" class="btn btn-primary btn-block">이름 · 연락처 저장</button>
+    </form>
+    <button type="button" class="btn btn-outline btn-block" id="logoutBtn" style="margin-top:10px">로그아웃</button>`;
   }
 
   $("#myBody").innerHTML = `
     <div class="my-card">
       <div style="flex:1;min-width:200px">
         <p>${gradeBadge(grade)} 등급 · 적립률 ${Math.round(grade.rate * 100)}%</p>
-        <h3>${escapeHTML(u.name)}님</h3>
-        <div class="progress"><i style="width:${progress}%"></i></div>
-        <p>${next ? `${won(next.minSpent - u.totalSpent)} 더 구매하면 ${next.name} 등급 (${Math.round(next.rate * 100)}% 적립)` : "최고 등급입니다."}</p>
+        <h3>${escapeHTML(profile.name)} 님</h3>
+        <p>${escapeHTML(profile.email)}</p>
       </div>
-      <div><p>보유 포인트</p><p class="my-point">${point(u.points)}</p></div>
+      <div><p>보유 포인트</p><p class="my-point">${point(profile.points)}</p></div>
     </div>
+    ${profile._fallback ? '<p class="error">회원 정보를 DB 에서 읽지 못해 일부 값이 비어 있을 수 있습니다.</p>' : ""}
     <div class="my-tabs" role="tablist">
-      <button type="button" class="my-tab${tab === "orders" ? " active" : ""}" data-tab="orders">주문 내역 (${u.orders.length})</button>
-      <button type="button" class="my-tab${tab === "points" ? " active" : ""}" data-tab="points">포인트 내역</button>
-      <button type="button" class="my-tab${tab === "info" ? " active" : ""}" data-tab="info">회원 정보</button>
+      <button type="button" class="my-tab${tab === "orders" ? " active" : ""}" data-tab="orders">주문 내역</button>
+      <button type="button" class="my-tab${tab !== "orders" ? " active" : ""}" data-tab="info">회원 정보</button>
     </div>
     ${content}`;
 
   $$("#myBody .my-tab").forEach((b) => b.addEventListener("click", () => renderMyPage(b.dataset.tab)));
   const out = $("#logoutBtn");
   if (out) out.addEventListener("click", logout);
+  const pf = $("#profileForm");
+  if (pf) pf.addEventListener("submit", saveProfile);
+}
+
+/* 이름 · 연락처만 shop_profiles 에 저장 (grade · points · role 은 보내지 않음) */
+async function saveProfile(e) {
+  e.preventDefault();
+  const form = e.target;
+  const name = $("#pfName").value.trim();
+  const phone = $("#pfPhone").value.trim();
+  const error = (msg) => { $("#profileError").textContent = msg; };
+  if (!name) return error("이름을 입력해 주세요.");
+  if (!/^01[0-9]-?\d{3,4}-?\d{4}$/.test(phone)) return error("휴대폰 번호를 확인해 주세요.");
+  if (!dbReady("#profileError")) return;
+
+  setBusy(form, true, "저장 중...");
+  const { error: err } = await db
+    .from("shop_profiles")
+    .update({ name, phone })
+    .eq("id", profile.id);
+  setBusy(form, false);
+  if (err) return error("저장하지 못했습니다. " + koreanAuthError(err));
+
+  await loadProfile();
+  refreshUser();
+  renderMyPage("info");
+  showToast("회원 정보를 저장했습니다.");
 }
 
 
@@ -734,7 +822,7 @@ function renderGrades() {
   $("#gradeGrid").innerHTML = GRADES.map((g) => `<div class="grade-card" style="--gc:${g.color}">
     <p class="name">${g.name}</p>
     <p class="rate">${Math.round(g.rate * 100)}<small>% 적립</small></p>
-    <p>${g.desc}</p>
+    <p>${g.desc} · ${g.code}</p>
   </div>`).join("");
 }
 
@@ -742,3 +830,4 @@ renderGrades();
 renderFilters();
 saveCart();
 refreshUser();
+initAuth();

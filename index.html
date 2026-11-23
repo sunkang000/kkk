@@ -28,12 +28,20 @@
         <a href="#products" data-category="ball">축구공</a>
         <a href="#products" data-category="gear">축구 용품</a>
         <a href="#membership">멤버십</a>
+        <!-- 모바일 메뉴에서만 보이는 회원 메뉴 -->
+        <span class="nav-auth">
+          <a href="#" id="navUser">로그인</a>
+          <a href="#" id="navAuth">회원가입</a>
+        </span>
       </nav>
 
       <div class="header-actions">
         <button class="icon-btn" id="userBtn" type="button" aria-label="로그인 또는 마이페이지">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>
           <span class="btn-label" id="userLabel">로그인</span>
+        </button>
+        <button class="icon-btn auth-btn" id="authBtn" type="button">
+          <span id="authLabel">회원가입</span>
         </button>
         <button class="icon-btn cart-btn" id="cartBtn" type="button" aria-label="장바구니">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h14l-1 13H6L5 8Z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg>
@@ -169,14 +177,13 @@
           <input type="text" id="signupName" autocomplete="name">
           <label for="signupEmail">이메일 (아이디)</label>
           <input type="email" id="signupEmail" autocomplete="email">
-          <label for="signupPw">비밀번호 (8자 이상)</label>
-          <input type="password" id="signupPw" autocomplete="new-password">
+          <label for="signupPw">비밀번호 (6자 이상)</label>
+          <input type="password" id="signupPw" autocomplete="new-password" minlength="6" aria-describedby="pwHint">
+          <p class="hint" id="pwHint">비밀번호는 6자 이상으로 입력해 주세요. 다른 사이트에서 쓰는 비밀번호는 쓰지 마세요.</p>
           <label for="signupPw2">비밀번호 확인</label>
           <input type="password" id="signupPw2" autocomplete="new-password">
           <label for="signupPhone">휴대폰 번호</label>
           <input type="tel" id="signupPhone" placeholder="010-0000-0000" autocomplete="tel">
-          <label for="signupAddr">배송지 주소</label>
-          <input type="text" id="signupAddr" autocomplete="street-address">
           <label class="check"><input type="checkbox" id="signupAgree"> (필수) 이용약관 및 개인정보 수집에 동의합니다.</label>
           <p class="error" id="signupError"></p>
           <button type="submit" class="btn btn-primary btn-block">가입하고 3,000P 받기</button>
